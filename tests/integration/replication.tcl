@@ -1734,6 +1734,57 @@ test {replica can handle EINTR if use diskless load} {
     }
 } {} {external:skip}
 
+test {replica load times out after repl-timeout following an EINTR on the diskless load read} {
+    start_server {tags {"repl"}} {
+        set replica [srv 0 client]
+        start_server {} {
+            set master [srv 0 client]
+            set master_host [srv 0 host]
+            set master_port [srv 0 port]
+
+            $master debug populate 100 master 100000
+            $master config set rdbcompression no
+            $master config set repl-diskless-sync yes
+            $master config set repl-diskless-sync-delay 0
+            # Stream slowly so the transfer is still running when we stall it.
+            $master config set rdb-key-save-delay 100000
+            $master config set save ""
+            $replica config set repl-diskless-load on-empty-db
+            $replica config set repl-timeout 2
+
+            $replica replicaof $master_host $master_port
+            set res [wait_for_log_messages -1 {"*Loading DB in memory*"} 0 200 10]
+            set loglines [lindex $res 1]
+
+            # In diskless sync the RDB is written by the forked child, so stall
+            # the child. The replica then blocks in read() with its
+            # repl-timeout receive timeout armed.
+            set child_pid [get_child_pid 0]
+            assert {$child_pid ne ""}
+            pause_process $child_pid
+            after 500
+
+            # One explicit SIGALRM interrupts that read() with EINTR. The
+            # SIGALRM handler is always installed, no watchdog is needed.
+            exec kill -SIGALRM [srv -1 pid]
+            set res [wait_for_log_messages -1 {"*Received SIGALRM*"} $loglines 50 100]
+            set loglines [lindex $res 1]
+
+            # The replica cannot answer INFO while it is blocked in the load,
+            # so only its log is checked. The primary stays stalled, so only
+            # the read timeout can end the load. A stale EINTR makes rio.c
+            # retry that timeout forever.
+            set found [catch {
+                wait_for_log_messages -1 \
+                    {"*Failed trying to load the PRIMARY synchronization DB from socket*"} \
+                    $loglines 60 100
+            } err]
+            resume_process $child_pid
+            assert_equal 0 $found
+        }
+    }
+} {} {external:skip}
+
 start_server {tags {"repl" "external:skip"}} {
     test "replica do not write the reply to the replication link - SYNC (_addReplyToBufferOrList)" {
         set rd [valkey_deferring_client]
